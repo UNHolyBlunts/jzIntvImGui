@@ -1,0 +1,436 @@
+diff -ruN orig/app/src/main/cpp/CMakeLists.txt jzIntvImGui-main/app/src/main/cpp/CMakeLists.txt
+--- orig/app/src/main/cpp/CMakeLists.txt	2026-11-12 22:44:03.591891293 +0000
++++ jzIntvImGui-main/app/src/main/cpp/CMakeLists.txt	2026-11-12 22:44:03.745777609 +0000
+@@ -26,6 +26,7 @@
+         jzintv/plat/plat_gen.c
+         jzintv/minilzo/minilzo.c
+         jzintv/jzintv.c
++        jzintv/netplay/netplay.c
+         jzintv/pads/pads_cgc_win32.c
+         jzintv/pads/pads_intv2pc.c
+         jzintv/cfg/cfg.c
+diff -ruN orig/app/src/main/cpp/jzintv/jzintv.c jzIntvImGui-main/app/src/main/cpp/jzintv/jzintv.c
+--- orig/app/src/main/cpp/jzintv/jzintv.c	2026-11-12 22:44:03.680924850 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/jzintv.c	2026-11-12 22:44:03.745601142 +0000
+@@ -42,6 +42,7 @@
+ #include "cheat/cheat.h"
+ #include "cfg/mapping.h"
+ #include "cfg/cfg.h"
++#include "netplay/netplay.h"
+ 
+ cfg_t intv;
+ 
+@@ -406,6 +407,32 @@
+     jzp_printf("Starting jzIntv...\n");
+     jzp_flush();
+ 
++
++    /* -------------------------------------------------------------------- */
++    /*  Netplay: JZINTV_NETPLAY="host:PORT[:DELAY]" or "join:IP:PORT[:DELAY]"*/
++    /* -------------------------------------------------------------------- */
++    {
++        const char *np = getenv("JZINTV_NETPLAY");
++        if (np && *np)
++        {
++            char buf[128]; strncpy(buf, np, sizeof buf - 1); buf[sizeof buf - 1] = 0;
++            char *mode = strtok(buf, ":");
++            int ok = -1;
++            if (mode && !strcmp(mode, "host"))
++            {
++                char *port = strtok(NULL, ":"), *dly = strtok(NULL, ":");
++                if (port) ok = netplay_start(1, NULL, (uint16_t)atoi(port), dly ? atoi(dly) : 3, NULL);
++            }
++            else if (mode && !strcmp(mode, "join"))
++            {
++                char *ip = strtok(NULL, ":"), *port = strtok(NULL, ":"), *dly = strtok(NULL, ":");
++                if (ip && port) ok = netplay_start(0, ip, (uint16_t)atoi(port), dly ? atoi(dly) : 3, NULL);
++            }
++            if (ok == 0) pad_netplay_attach(&intv.pad0);
++            else jzp_printf("netplay: bad JZINTV_NETPLAY setting\n");
++        }
++    }
++
+ restart:
+ 
+     now = elapsed(/* restart = */ true);
+diff -ruN orig/app/src/main/cpp/jzintv/netplay/netplay.c jzIntvImGui-main/app/src/main/cpp/jzintv/netplay/netplay.c
+--- orig/app/src/main/cpp/jzintv/netplay/netplay.c	1970-01-01 00:00:00.000000000 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/netplay/netplay.c	2026-11-12 22:44:03.701822329 +0000
+@@ -0,0 +1,215 @@
++#include "netplay.h"
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#ifdef _WIN32
++# include <winsock2.h>
++# include <ws2tcpip.h>
++typedef int socklen_t;
++# define CLOSESOCK closesocket
++# define NOW_MS() ((uint64_t)GetTickCount64())
++# define SLEEP_MS(x) Sleep(x)
++#else
++# include <unistd.h>
++# include <time.h>
++# include <fcntl.h>
++# include <errno.h>
++# include <sys/socket.h>
++# include <netinet/in.h>
++# include <arpa/inet.h>
++# define CLOSESOCK close
++static uint64_t now_ms_(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000;}
++# define NOW_MS() now_ms_()
++# define SLEEP_MS(x) usleep((x)*1000)
++#endif
++
++#define RING 256
++#define MASK (RING-1)
++#define REDUND 8
++#define MAGIC 0x504E5A4Au  /* 'JZNP' */
++#define T_HELLO 0
++#define T_INPUT 1
++#define DISCONNECT_MS 5000
++
++typedef struct {
++    uint32_t magic; uint8_t type, count; uint16_t pad;
++    uint32_t frame, check_frame, check;
++    uint8_t  data[REDUND][NP_INPUT_BYTES];
++} pkt_t;   /* 144 bytes; assumes little-endian hosts (ARM, x86) */
++
++static struct {
++    int active, is_host, delay, synced, desynced, peer_known, hello_seen;
++    int sock; struct sockaddr_in peer;
++    uint32_t frame;
++    uint8_t  loc[RING][NP_INPUT_BYTES];  uint32_t loc_tag[RING];
++    uint8_t  rem[RING][NP_INPUT_BYTES];  uint32_t rem_tag[RING]; uint8_t rem_ok[RING];
++    uint32_t my_check[RING]; uint32_t my_check_tag[RING]; uint8_t my_check_ok[RING];
++    uint32_t rem_check[RING]; uint32_t rem_check_tag[RING]; uint8_t rem_check_ok[RING];
++    netplay_log_fn log;
++    pkt_t last;  int have_last;
++} S;
++
++static void say(const char *m){ if (S.log) S.log(m); else fprintf(stderr,"[netplay] %s\n",m); }
++
++#ifdef NETPLAY_TEST
++static int drop_pct = 0;
++void netplay_test_drop(int pct){ drop_pct = pct; }
++#endif
++
++static void send_pkt(const pkt_t *p)
++{
++    if (!S.peer_known) return;
++#ifdef NETPLAY_TEST
++    if (drop_pct && (rand() % 100) < drop_pct) return;
++#endif
++    sendto(S.sock, (const char *)p, sizeof *p, 0,
++           (struct sockaddr *)&S.peer, sizeof S.peer);
++}
++
++static void send_hello(void)
++{
++    pkt_t p; memset(&p, 0, sizeof p);
++    p.magic = MAGIC; p.type = T_HELLO;
++    send_pkt(&p);
++}
++
++static void compare_check(uint32_t f)
++{
++    int i = f & MASK;
++    if (S.my_check_ok[i] && S.my_check_tag[i] == f &&
++        S.rem_check_ok[i] && S.rem_check_tag[i] == f &&
++        S.my_check[i] != S.rem_check[i] && !S.desynced) {
++        S.desynced = 1; say("DESYNC: emulator states differ between players");
++    }
++}
++
++static void poll_net(void)
++{
++    for (;;) {
++        pkt_t p; struct sockaddr_in from; socklen_t fl = sizeof from;
++        int n = (int)recvfrom(S.sock, (char *)&p, sizeof p, 0,
++                              (struct sockaddr *)&from, &fl);
++        if (n != (int)sizeof p || p.magic != MAGIC) break;
++        if (!S.peer_known) { S.peer = from; S.peer_known = 1; }
++        else if (from.sin_addr.s_addr != S.peer.sin_addr.s_addr ||
++                 from.sin_port != S.peer.sin_port) continue;
++        if (p.type == T_HELLO) { S.hello_seen = 1; continue; }
++        if (p.type != T_INPUT || p.count == 0 || p.count > REDUND) continue;
++        S.hello_seen = 1;
++        for (int i = 0; i < p.count; i++) {
++            uint32_t f = p.frame - (uint32_t)(p.count - 1 - i);
++            if ((int32_t)(f - S.frame) < 0) continue;      /* already used */
++            if ((int32_t)(f - S.frame) >= RING - 1) continue;
++            memcpy(S.rem[f & MASK], p.data[i], NP_INPUT_BYTES);
++            S.rem_tag[f & MASK] = f; S.rem_ok[f & MASK] = 1;
++        }
++        S.rem_check[p.check_frame & MASK] = p.check;
++        S.rem_check_tag[p.check_frame & MASK] = p.check_frame;
++        S.rem_check_ok[p.check_frame & MASK] = 1;
++        compare_check(p.check_frame);
++    }
++}
++
++int netplay_start(int is_host, const char *ip, uint16_t port, int delay,
++                  netplay_log_fn log_fn)
++{
++    memset(&S, 0, sizeof S);
++    S.log = log_fn; S.is_host = is_host; S.delay = delay < 1 ? 1 : delay > 6 ? 6 : delay;
++#ifdef _WIN32
++    { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); }
++#endif
++    S.sock = (int)socket(AF_INET, SOCK_DGRAM, 0);
++    if (S.sock < 0) { say("socket() failed"); return -1; }
++#ifdef _WIN32
++    { u_long nb = 1; ioctlsocket(S.sock, FIONBIO, &nb); }
++#else
++    fcntl(S.sock, F_SETFL, fcntl(S.sock, F_GETFL, 0) | O_NONBLOCK);
++#endif
++    struct sockaddr_in me; memset(&me, 0, sizeof me);
++    me.sin_family = AF_INET; me.sin_addr.s_addr = htonl(INADDR_ANY);
++    me.sin_port = htons(is_host ? port : 0);
++    if (bind(S.sock, (struct sockaddr *)&me, sizeof me) < 0) { say("bind() failed"); CLOSESOCK(S.sock); return -1; }
++    if (!is_host) {
++        memset(&S.peer, 0, sizeof S.peer);
++        S.peer.sin_family = AF_INET; S.peer.sin_port = htons(port);
++        if (!ip || inet_pton(AF_INET, ip, &S.peer.sin_addr) != 1) { say("bad host address"); CLOSESOCK(S.sock); return -1; }
++        S.peer_known = 1;
++    }
++    for (int f = 0; f < S.delay; f++) {   /* first 'delay' frames are neutral */
++        S.loc_tag[f] = f; S.rem_tag[f] = f; S.rem_ok[f] = 1;
++    }
++    S.active = 1;
++    say(is_host ? "waiting for the other player..." : "connecting...");
++    return 0;
++}
++
++int netplay_active(void) { return S.active; }
++int netplay_desynced(void) { return S.desynced; }
++void netplay_stop(void) { if (S.active) { CLOSESOCK(S.sock); S.active = 0; } }
++
++static void build_and_send(uint32_t eff_frame)
++{
++    pkt_t p; memset(&p, 0, sizeof p);
++    p.magic = MAGIC; p.type = T_INPUT; p.frame = eff_frame;
++    p.check_frame = S.frame; p.check = S.my_check[S.frame & MASK];
++    p.count = (uint8_t)(eff_frame + 1 < REDUND ? eff_frame + 1 : REDUND);
++    for (int i = 0; i < p.count; i++) {
++        uint32_t f = eff_frame - (uint32_t)(p.count - 1 - i);
++        if (S.loc_tag[f & MASK] == f) memcpy(p.data[i], S.loc[f & MASK], NP_INPUT_BYTES);
++    }
++    S.last = p; S.have_last = 1;
++    send_pkt(&p);
++}
++
++int netplay_frame(uint32_t check, const uint8_t local[NP_INPUT_BYTES],
++                  uint8_t out_r[NP_INPUT_BYTES], uint8_t out_l[NP_INPUT_BYTES])
++{
++    if (!S.active) return 0;
++    uint64_t t0 = NOW_MS(), tr = 0;
++
++    /* First call: handshake. Emulation is paused here on both machines, so
++       both resume from the same emulated instant.                          */
++    if (!S.synced) {
++        uint64_t last_hello = 0;
++        while (!S.hello_seen) {
++            poll_net();
++            uint64_t t = NOW_MS();
++            if (!S.is_host && t - last_hello > 200) { send_hello(); last_hello = t; }
++            if (S.is_host && S.peer_known && t - last_hello > 200) { send_hello(); last_hello = t; }
++            if (t - t0 > 60000) { say("no player connected, netplay off"); netplay_stop(); return 0; }
++            SLEEP_MS(5);
++        }
++        for (int i = 0; i < 5; i++) { send_hello(); SLEEP_MS(10); }
++        S.synced = 1; say("connected");
++    }
++
++    uint32_t f = S.frame;
++    S.my_check[f & MASK] = check; S.my_check_tag[f & MASK] = f; S.my_check_ok[f & MASK] = 1;
++    compare_check(f);
++
++    /* Local input takes effect 'delay' frames from now. */
++    uint32_t eff = f + (uint32_t)S.delay;
++    memcpy(S.loc[eff & MASK], local, NP_INPUT_BYTES); S.loc_tag[eff & MASK] = eff;
++    build_and_send(eff);
++
++    /* Wait for the peer's input for frame f. */
++    t0 = NOW_MS();
++    for (;;) {
++        poll_net();
++        if (S.rem_ok[f & MASK] && S.rem_tag[f & MASK] == f) break;
++        uint64_t t = NOW_MS();
++        if (t - t0 > DISCONNECT_MS) { say("peer lost, netplay off"); netplay_stop(); return 0; }
++        if (t - tr > 15) { if (S.have_last) send_pkt(&S.last); tr = t; }
++        SLEEP_MS(1);
++    }
++
++    const uint8_t *mine = (S.loc_tag[f & MASK] == f) ? S.loc[f & MASK] : NULL;
++    uint8_t zero[NP_INPUT_BYTES] = {0};
++    if (!mine) mine = zero;
++    const uint8_t *theirs = S.rem[f & MASK];
++    memcpy(S.is_host ? out_r : out_l, mine,   NP_INPUT_BYTES);
++    memcpy(S.is_host ? out_l : out_r, theirs, NP_INPUT_BYTES);
++    S.rem_ok[f & MASK] = 0;
++    S.frame++;
++    return 1;
++}
+diff -ruN orig/app/src/main/cpp/jzintv/netplay/netplay.h jzIntvImGui-main/app/src/main/cpp/jzintv/netplay/netplay.h
+--- orig/app/src/main/cpp/jzintv/netplay/netplay.h	1970-01-01 00:00:00.000000000 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/netplay/netplay.h	2026-11-12 22:44:03.701838681 +0000
+@@ -0,0 +1,31 @@
++/* Lockstep netplay core for jzIntv. UDP, two players, input-delay based. */
++#ifndef NETPLAY_H_
++#define NETPLAY_H_
++#include <stdint.h>
++
++#define NP_INPUT_BYTES 16   /* 15 keypad/action entries + 1 raw-bits entry */
++
++typedef void (*netplay_log_fn)(const char *msg);
++
++/* Start a session. is_host: listen on port. Otherwise connect to ip:port.
++   delay: input delay in frames (2-4 is typical). Returns 0 on success.   */
++int  netplay_start(int is_host, const char *ip, uint16_t port, int delay,
++                   netplay_log_fn log_fn);
++
++/* 1 while a session is active (not started, failed, or dropped -> 0).    */
++int  netplay_active(void);
++
++/* Call once per emulated video frame, at the same emulated instant on both
++   machines. 'local' is this player's controller state; 'check' is a value
++   that must be identical on both sides each frame (e.g. total CPU cycles).
++   Blocks until the peer's input for this frame arrives. On success fills
++   out_r (host/player-1 controller) and out_l (player-2 controller) and
++   returns 1. Returns 0 if the session ended; caller then uses live input. */
++int  netplay_frame(uint32_t check, const uint8_t local[NP_INPUT_BYTES],
++                   uint8_t out_r[NP_INPUT_BYTES], uint8_t out_l[NP_INPUT_BYTES]);
++
++/* Nonzero if the peers' check values ever disagreed (game states drifted). */
++int  netplay_desynced(void);
++
++void netplay_stop(void);
++#endif
+diff -ruN orig/app/src/main/cpp/jzintv/pads/pads.c jzIntvImGui-main/app/src/main/cpp/jzintv/pads/pads.c
+--- orig/app/src/main/cpp/jzintv/pads/pads.c	2026-11-12 22:44:03.685830039 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/pads/pads.c	2026-11-12 22:44:03.744379881 +0000
+@@ -37,7 +37,8 @@
+         /* ---------------------------------------------------------------- */
+         /*  Merge all of the keypad / action key inputs to the controller.  */
+         /* ---------------------------------------------------------------- */
+-        const uint32_t *const event_inputs = side_idx == 0 ? pad->r : pad->l;
++        const uint32_t *const event_inputs = pad->net ? (side_idx == 0 ? pad->nr : pad->nl)
++                                                      : (side_idx == 0 ? pad->r  : pad->l );
+         uint32_t merged_inputs = 0;
+         for (int i = 0; i < 15; i++)
+             merged_inputs |= event_inputs[i];
+@@ -506,3 +507,41 @@
+ /* ======================================================================== */
+ /*                 Copyright (c) 1998-2020, Joseph Zbiciak                  */
+ /* ======================================================================== */
++
++/* ======================================================================== */
++/*  NETPLAY GLUE -- called by the STIC once per frame.                      */
++/* ======================================================================== */
++#include "netplay/netplay.h"
++#include <string.h>
++
++static pad_t *np_pad = NULL;
++
++void pad_netplay_attach(pad_t *pad) { np_pad = pad; }
++
++void pad_netplay_frame(uint64_t cycle)
++{
++    if (!np_pad) return;
++    if (!netplay_active())
++    {
++        if (np_pad->net) { np_pad->net = false; np_pad->stale = true; }
++        return;
++    }
++
++    /* Local player always uses the normal "player 1" (right) controls.    */
++    uint8_t local[NP_INPUT_BYTES], out_r[NP_INPUT_BYTES], out_l[NP_INPUT_BYTES];
++    for (int i = 0; i < 15; i++) local[i] = (uint8_t)np_pad->r[i];
++    local[15] = (uint8_t)np_pad->r[17];
++
++    if (!netplay_frame((uint32_t)cycle, local, out_r, out_l))
++    {
++        np_pad->net = false; np_pad->stale = true;
++        return;
++    }
++
++    memset(np_pad->nr, 0, sizeof np_pad->nr);
++    memset(np_pad->nl, 0, sizeof np_pad->nl);
++    for (int i = 0; i < 15; i++) { np_pad->nr[i] = out_r[i]; np_pad->nl[i] = out_l[i]; }
++    np_pad->nr[17] = out_r[15]; np_pad->nl[17] = out_l[15];
++    np_pad->net   = true;
++    np_pad->stale = true;
++}
+diff -ruN orig/app/src/main/cpp/jzintv/pads/pads.h jzIntvImGui-main/app/src/main/cpp/jzintv/pads/pads.h
+--- orig/app/src/main/cpp/jzintv/pads/pads.h	2026-11-12 22:44:03.685848405 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/pads/pads.h	2026-11-12 22:44:03.743957344 +0000
+@@ -30,8 +30,17 @@
+     uint32_t    r[18];      /*  Event inputs to right controllers.          */
+     uint32_t    k[8];       /*  Keyboard inputs for all 8 scanning rows.    */
+     uint32_t    fake_shift; /*  We fake pressing the shift key sometimes.   */
++
++    /* Netplay: synchronized inputs, applied once per frame.                */
++    bool        net;        /*  Flag: use nr/nl instead of live l/r.        */
++    uint32_t    nl[18];     /*  Netplay inputs to left controller.          */
++    uint32_t    nr[18];     /*  Netplay inputs to right controller.         */
+ } pad_t;
+ 
++/* Netplay hooks (see netplay/netplay.h). */
++void pad_netplay_attach(pad_t *pad);
++void pad_netplay_frame(uint64_t cycle);
++
+ /* ======================================================================== */
+ /*  PAD_INIT     -- Makes an input pad device                               */
+ /* ======================================================================== */
+diff -ruN orig/app/src/main/cpp/jzintv/stic/stic.c jzIntvImGui-main/app/src/main/cpp/jzintv/stic/stic.c
+--- orig/app/src/main/cpp/jzintv/stic/stic.c	2026-11-12 22:44:03.688882507 +0000
++++ jzIntvImGui-main/app/src/main/cpp/jzintv/stic/stic.c	2026-11-12 22:44:03.745131659 +0000
+@@ -2475,6 +2475,8 @@
+ /* ======================================================================== */
+ /*  STIC_GENERATE_REQS   -- Generate INTRQ/BUSRQ for the next frame.        */
+ /* ======================================================================== */
++extern void pad_netplay_frame(uint64_t cycle);
++
+ LOCAL void stic_generate_reqs(stic_t *const RESTRICT stic)
+ {
+     const uint64_t frame_ref = stic->next_frame_intrq;
+@@ -2485,6 +2487,7 @@
+     /* -------------------------------------------------------------------- */
+     stic->last_frame_intrq  = stic->next_frame_intrq;
+     stic->next_frame_intrq += STIC_FRAMCLKS;
++    pad_netplay_frame(stic->last_frame_intrq);   /* netplay lockstep point */
+ 
+     if (stic->debug_flags & STIC_DBG_REQS)
+     {
+diff -ruN orig/app/src/main/cpp/main.cpp jzIntvImGui-main/app/src/main/cpp/main.cpp
+--- orig/app/src/main/cpp/main.cpp	2026-11-12 22:44:03.693513788 +0000
++++ jzIntvImGui-main/app/src/main/cpp/main.cpp	2026-11-12 22:44:22.915360766 +0000
+@@ -1,3 +1,5 @@
++#include <fstream>
++#include <cstdlib>
+ ﻿/*
+ Mit license
+ Copyright 2021 Daniele Moglia
+@@ -1208,6 +1210,21 @@
+         int argc;
+         char **argv = convert_to_argv_argc(&commands, &argc);
+ 
++        {   // Netplay: netplay.txt in the config folder holds "host:7777" or "join:192.168.1.20:7777"
++            string np_file = app_config_struct.root_folder_for_configuration;
++            np_file.append("netplay.txt");
++            std::ifstream npf(np_file.c_str());
++            std::string np_line;
++            while (npf && std::getline(npf, np_line) && (np_line.empty() || np_line[0] == '#')) {}
++            while (!np_line.empty() && (np_line.back() == '\r' || np_line.back() == ' ')) np_line.pop_back();
++#ifdef WIN32
++            _putenv_s("JZINTV_NETPLAY", (npf && !np_line.empty()) ? np_line.c_str() : "");
++#else
++            if (npf && !np_line.empty()) setenv("JZINTV_NETPLAY", np_line.c_str(), 1);
++            else unsetenv("JZINTV_NETPLAY");
++#endif
++        }
++
+         if (app_config_struct.use_external_jzintv) {
+             string external_jzintv_complete_filename = app_config_struct.root_folder_for_configuration;
+ #ifdef WIN32
